@@ -6,12 +6,49 @@
 #include <bitset>
 #include <cassert>
 #include <cmath>
+#include <vector>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
 #define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
 #define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
+
+// graded-precision MoE expert groups: hot / warm / cold
+#define MOE_N_GRP 3
+enum llama_moe_grp {
+    MOE_GRP_HOT  = 0,
+    MOE_GRP_WARM = 1,
+    MOE_GRP_COLD = 2,
+};
+
+// Per-layer mapping from global expert id to (group, group-local id).
+// Experts outside a group's own subset are not stored in that group.
+struct llama_moe_expert_map {
+    bool active = false;
+
+    int32_t n_expert[MOE_N_GRP] = { 0, 0, 0 };
+
+    // global expert id -> group, or -1 when the expert is not routed
+    int8_t  grp_of[LLAMA_MAX_EXPERTS] = { 0 };
+    // global expert id -> index inside that group
+    int16_t local_of[LLAMA_MAX_EXPERTS] = { 0 };
+
+    // lookup tables fed to ggml_get_rows at graph build time
+    std::vector<int32_t> lut[MOE_N_GRP];  // global id -> local id (0 if absent)
+
+    void reset(int32_t n_expert_total) {
+        active = false;
+        for (int g = 0; g < MOE_N_GRP; ++g) {
+            n_expert[g] = 0;
+            lut[g].assign(n_expert_total, 0);
+        }
+        for (int32_t e = 0; e < n_expert_total && e < LLAMA_MAX_EXPERTS; ++e) {
+            grp_of[e]   = -1;
+            local_of[e] = 0;
+        }
+    }
+};
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,

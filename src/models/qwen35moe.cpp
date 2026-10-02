@@ -1,4 +1,6 @@
 #include "models.h"
+
+#include <cstring>
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -91,10 +93,15 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
         }
 
-        // Routed experts
+        // Routed experts. Group metadata has to be read first: when it is present
+        // the expert weights live in per-tier tensors and the merged ones are
+        // absent, so they must not be required.
+        load_moe_expert_groups(layer, il, ml);
+        const int exp_flags = layer.moe_grp.active ? (flags | TENSOR_NOT_REQUIRED) : flags;
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, exp_flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, exp_flags);
+        create_tensor_exps_groups(layer, il, n_embd, n_ff_exp, flags);
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
@@ -118,10 +125,13 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
 
-        // Routed experts
+        // Routed experts, same grouping rule as the trunk block.
+        load_moe_expert_groups(layer, il, ml);
+        const int exp_flags = layer.moe_grp.active ? (mtp_flags | TENSOR_NOT_REQUIRED) : mtp_flags;
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, exp_flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, exp_flags);
+        create_tensor_exps_groups(layer, il, n_embd, n_ff_exp, mtp_flags);
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, mtp_flags);
@@ -156,6 +166,51 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35moe::build_arch_graph(const
 llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    // graded-precision MoE expert groups: per-layer global->local id tables.
+    // get_rows maps every selected global expert id through the table of its
+    // group; ids absent from a group map to 0 and contribute nothing to the sum.
+    // ctx0 has no_alloc set, so t->data is null while the graph is built. The
+    // bytes are written in llm_graph_input_moe_lut::set_input() instead, which
+    // runs after ggml_backend_sched_alloc_graph().
+    res->t_moe_lut.resize(model.layers.size());
+    res->t_moe_mask.resize(model.layers.size());
+    llm_graph_input_moe_lut * moe_lut_in = nullptr;
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        const llama_moe_expert_map & m = model.layers[il].moe_grp;
+        if (!m.active) {
+            continue;
+        }
+        res->t_moe_lut[il].resize(MOE_N_GRP, nullptr);
+        res->t_moe_mask[il].resize(MOE_N_GRP, nullptr);
+        for (int g = 0; g < MOE_N_GRP; ++g) {
+            const size_t n = m.lut[g].size();
+            // shaped like the other get_rows tables in this file: [1, n_expert, n_tokens]
+            ggml_tensor * t = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 1, n, n_tokens);
+            ggml_set_name(t, "moe_lut");
+            ggml_set_input(t);
+            res->t_moe_lut[il][g] = t;
+
+            // ids outside this group must contribute nothing
+            std::vector<float> mv(n);
+            for (size_t e = 0; e < n; e++) {
+                mv[e] = m.grp_of[e] == g ? 1.0f : 0.0f;
+            }
+            ggml_tensor * mt = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n, n_tokens);
+            ggml_set_name(mt, "moe_mask");
+            ggml_set_input(mt);
+            res->t_moe_mask[il][g] = mt;
+
+            if (moe_lut_in == nullptr) {
+                moe_lut_in = new llm_graph_input_moe_lut();
+            }
+            moe_lut_in->add(t, &m.lut[g]);
+            moe_lut_in->add_mask(mt, std::move(mv));
+        }
+    }
+    if (moe_lut_in != nullptr) {
+        res->add_input(llm_graph_input_ptr(moe_lut_in));
+    }
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -495,6 +550,22 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // model.layers is const here; copy the group arrays so they match the
+    // non-const parameter types. A null lut means this layer is ungrouped.
+    ggml_tensor * moe_grp_gate[MOE_N_GRP] = { nullptr };
+    ggml_tensor * moe_grp_up[MOE_N_GRP]   = { nullptr };
+    ggml_tensor * moe_grp_down[MOE_N_GRP] = { nullptr };
+    ggml_tensor * moe_grp_lut[MOE_N_GRP]  = { nullptr };
+    // the MTP graph never builds these tables, so index-check before touching them
+    if (il >= 0 && il < (int) res->t_moe_lut.size() && !res->t_moe_lut[il].empty()) {
+        for (int g = 0; g < MOE_N_GRP; ++g) {
+            moe_grp_gate[g] = model.layers[il].ffn_gate_exps_grp[g];
+            moe_grp_up[g]   = model.layers[il].ffn_up_exps_grp[g];
+            moe_grp_down[g] = model.layers[il].ffn_down_exps_grp[g];
+            moe_grp_lut[g]  = res->t_moe_lut[il][g];
+        }
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -509,7 +580,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+                nullptr,
+                moe_grp_gate,
+                moe_grp_up,
+                moe_grp_down,
+                moe_grp_lut);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
@@ -675,6 +751,22 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_attn_post_norm", il);
 
     // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe).
+    // model.layers is const here; copy the group arrays so they match the
+    // non-const parameter types. A null lut means this layer is ungrouped.
+    ggml_tensor * moe_grp_gate[MOE_N_GRP] = { nullptr };
+    ggml_tensor * moe_grp_up[MOE_N_GRP]   = { nullptr };
+    ggml_tensor * moe_grp_down[MOE_N_GRP] = { nullptr };
+    ggml_tensor * moe_grp_lut[MOE_N_GRP]  = { nullptr };
+    // the MTP graph never builds these tables, so index-check before touching them
+    if (il >= 0 && il < (int) res->t_moe_lut.size() && !res->t_moe_lut[il].empty()) {
+        for (int g = 0; g < MOE_N_GRP; ++g) {
+            moe_grp_gate[g] = model.layers[il].ffn_gate_exps_grp[g];
+            moe_grp_up[g]   = model.layers[il].ffn_up_exps_grp[g];
+            moe_grp_down[g] = model.layers[il].ffn_down_exps_grp[g];
+            moe_grp_lut[g]  = res->t_moe_lut[il][g];
+        }
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             layer.ffn_gate_inp,
@@ -689,7 +781,12 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
             nullptr, layer.ffn_gate_up_exps,
             layer.ffn_up_exps_s,
             layer.ffn_gate_exps_s,
-            layer.ffn_down_exps_s);
+            layer.ffn_down_exps_s,
+                nullptr,
+                moe_grp_gate,
+                moe_grp_up,
+                moe_grp_down,
+                moe_grp_lut);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
     if (layer.ffn_up_shexp != nullptr) {

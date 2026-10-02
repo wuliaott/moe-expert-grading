@@ -347,6 +347,15 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+            // ff MoE graded-precision expert groups (hot / warm / cold).
+            // Each group holds a disjoint subset of the routed experts as its own 3D
+            // tensor so the groups can carry different quant types. Global expert id
+            // is remapped to a group-local id before mul_mat_id.
+    struct ggml_tensor * ffn_gate_exps_grp[MOE_N_GRP]    = { nullptr };
+    struct ggml_tensor * ffn_up_exps_grp[MOE_N_GRP]      = { nullptr };
+    struct ggml_tensor * ffn_gate_up_exps_grp[MOE_N_GRP] = { nullptr };
+    struct ggml_tensor * ffn_down_exps_grp[MOE_N_GRP]    = { nullptr };
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
@@ -600,6 +609,9 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    // graded-precision MoE expert groups; inactive for ordinary models
+    struct llama_moe_expert_map moe_grp;
 };
 
 struct llama_device {
@@ -833,6 +845,10 @@ struct llama_model_base : public llama_model {
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
+
+    // graded-precision MoE expert groups
+    void load_moe_expert_groups(llama_layer & layer, int il, llama_model_loader & ml);
+    void create_tensor_exps_groups(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int flags);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,

@@ -118,10 +118,70 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
     return res;
+}
+
+void llm_graph_input_moe_lut::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    // ne is [1, n_expert, n_tokens]: one copy of the table per token, and a
+    // copy is contiguous because ne[0] is 1.
+    for (size_t i = 0; i < luts.size(); i++) {
+        ggml_tensor * t = luts[i];
+        const std::vector<int32_t> & tbl = *data[i];
+        const size_t nbytes = tbl.size()*sizeof(int32_t);
+        for (int64_t k = 0; k < t->ne[2]; k++) {
+            ggml_backend_tensor_set(t, tbl.data(), k*nbytes, nbytes);
+        }
+    }
+
+    for (size_t i = 0; i < mask_t.size(); i++) {
+        ggml_tensor * t = mask_t[i];
+        const std::vector<float> & tbl = mask_d[i];
+        const size_t nbytes = tbl.size()*sizeof(float);
+        for (int64_t k = 0; k < t->ne[2]; k++) {
+            ggml_backend_tensor_set(t, tbl.data(), k*nbytes, nbytes);
+        }
+    }
+
+    // MOE_DEBUG: dump what actually went in, once
+    if (getenv("MOE_DEBUG") && !luts.empty()) {
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            fprintf(stderr, "MOE_DEBUG set_input: %zu luts, %zu masks\n",
+                    luts.size(), mask_t.size());
+            for (size_t i = 0; i < 3 && i < luts.size(); i++) {
+                ggml_tensor * t = luts[i];
+                const std::vector<int32_t> & tbl = *data[i];
+                int32_t mn = tbl[0], mx = tbl[0];
+                for (int32_t v : tbl) { if (v < mn) mn = v; if (v > mx) mx = v; }
+                fprintf(stderr, "  lut[%zu] ne=[%lld,%lld,%lld] buf=%s vals=%d..%d first8=",
+                        i, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2],
+                        t->buffer ? ggml_backend_buffer_name(t->buffer) : "(null)",
+                        mn, mx);
+                for (int k = 0; k < 8 && k < (int) tbl.size(); k++) fprintf(stderr, "%d ", tbl[k]);
+                fprintf(stderr, "\n");
+            }
+            for (size_t i = 0; i < 3 && i < mask_t.size(); i++) {
+                const std::vector<float> & m = mask_d[i];
+                double sum = 0;
+                for (float v : m) sum += v;
+                fprintf(stderr, "  mask[%zu] ne=[%lld,%lld,%lld] ones=%.0f\n",
+                        i, (long long)mask_t[i]->ne[0], (long long)mask_t[i]->ne[1],
+                        (long long)mask_t[i]->ne[2], sum);
+            }
+        }
+    }
+}
+
+bool llm_graph_input_moe_lut::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+
+    return true;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
@@ -1979,7 +2039,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor ** gate_exps_grp,
+         ggml_tensor ** up_exps_grp,
+         ggml_tensor ** down_exps_grp,
+         ggml_tensor ** lut_grp) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2000,8 +2064,80 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        gate_exps_grp,
+        up_exps_grp,
+        down_exps_grp,
+        lut_grp
     );
+}
+
+// graded-precision MoE expert groups
+
+// Remap global expert ids to group-local ids through a constant lookup table,
+// run one mul_mat_id per group, and add the results. Groups that own none of a
+// token's selected experts contribute zeros, so the sum equals the single
+// fused call that the ungrouped path performs.
+//
+// mul_mat_id output is [rows, n_expert_used, n_tokens]; n_expert_used is the
+// same for every group, so positions line up and no scatter is needed.
+ggml_tensor * llm_graph_context::build_moe_mm_id_grp(
+        ggml_tensor ** w_grp,
+        ggml_tensor ** lut_grp,
+        ggml_tensor * cur,
+        ggml_tensor * ids,
+        int il) const {
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tokens = cur->ne[2];
+
+    ggml_tensor * acc = nullptr;
+
+    for (int g = 0; g < MOE_N_GRP; ++g) {
+        if (w_grp[g] == nullptr) {
+            continue;
+        }
+
+        // match the layout upstream get_rows() already uses: the table is
+        // [1, n_expert, n_tokens] so a->ne[2] lines up with ids->ne[1].
+        // The result is [1, n_used, n_tokens]; mul_mat_id wants [n_used, n_tokens].
+        ggml_tensor * local = ggml_get_rows(ctx0, lut_grp[g], ids);
+        local = ggml_reshape_2d(ctx0, local, n_used, n_tokens);
+        cb(local, "ffn_moe_ids_local", il);
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx0, w_grp[g], cur, local);
+        cb(out, "ffn_moe_mm_id_grp", il);
+
+        if (getenv("MOE_DEBUG")) {
+            static int dumped = 0;
+            if (dumped < 4) {
+                dumped++;
+                fprintf(stderr, "  MOE_DEBUG grp%d w=[%lld,%lld,%lld] cur=[%lld,%lld,%lld] ids=[%lld,%lld] local=[%lld,%lld,%lld] out=[%lld,%lld,%lld]\n",
+                        g,
+                        (long long)w_grp[g]->ne[0], (long long)w_grp[g]->ne[1], (long long)w_grp[g]->ne[2],
+                        (long long)cur->ne[0], (long long)cur->ne[1], (long long)cur->ne[2],
+                        (long long)ids->ne[0], (long long)ids->ne[1],
+                        (long long)local->ne[0], (long long)local->ne[1], (long long)local->ne[2],
+                        (long long)out->ne[0], (long long)out->ne[1], (long long)out->ne[2]);
+            }
+        }
+
+        // An id this group does not own still luts to 0, which is a real row,
+        // so its slot would add group g's expert #0 to the result. Zero those
+        // slots; the sum over groups then equals the single ungrouped call.
+        if (!res->t_moe_mask.empty() &&
+                il < (int) res->t_moe_mask.size() &&
+                res->t_moe_mask[il].size() == MOE_N_GRP &&
+                res->t_moe_mask[il][g] != nullptr) {
+            ggml_tensor * valid = ggml_get_rows(ctx0, res->t_moe_mask[il][g], ids); // [1, n_used, n_tokens]
+            cb(valid, "ffn_moe_grp_valid", il);
+            out = ggml_mul(ctx0, out, valid);
+        }
+
+        acc = acc ? ggml_add(ctx0, acc, out) : out;
+    }
+
+    GGML_ASSERT(acc != nullptr);
+    return acc;
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
@@ -2028,7 +2164,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor ** gate_exps_grp,
+         ggml_tensor ** up_exps_grp,
+         ggml_tensor ** down_exps_grp,
+         ggml_tensor ** lut_grp) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2180,7 +2320,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
+    // a group without its lookup table cannot remap ids, so fall back to the
+    // merged expert tensors (the MTP block and ungrouped models take that path)
+    const bool grouped = gate_exps_grp && gate_exps_grp[MOE_GRP_HOT] != nullptr &&
+                         lut_grp && lut_grp[MOE_GRP_HOT] != nullptr;
+
+    if (grouped) {
+        // graded-precision path: gate and up are stored per group. Both come
+        // from the same input, so neither may be computed from the other.
+        ggml_tensor * gate_out = build_moe_mm_id_grp(gate_exps_grp, lut_grp, cur, selected_experts, il);
+        cb(gate_out, "ffn_moe_gate", il);
+
+        ggml_tensor * up_out = build_moe_mm_id_grp(up_exps_grp, lut_grp, cur, selected_experts, il);
+        cb(up_out, "ffn_moe_up", il);
+
+        cur = gate_out;
+        up  = up_out;
+    } else if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
@@ -2230,11 +2386,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    const bool has_gate = gate_exps || gate_up_exps;
+    // the grouped path also has a separate gate and up, like the plain
+    // gate_exps / up_exps pair below
+    const bool has_gate = gate_exps || gate_up_exps || grouped;
 
     switch (type_op) {
         case LLM_FFN_SILU:
-            if (gate_exps) {
+            if (gate_exps || grouped) {
                 if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
@@ -2315,7 +2473,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    if (grouped) {
+        experts = build_moe_mm_id_grp(down_exps_grp, lut_grp, cur, selected_experts, il);
+    } else {
+        experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    }
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);

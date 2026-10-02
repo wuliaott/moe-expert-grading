@@ -1809,3 +1809,8 @@ void llama_model_loader::print_info() const {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
 }
+
+// explicit instantiation: llama-model.cpp reads the graded-MoE group map with
+// get_arr<std::string, int>. The template is defined in this TU, so it must be
+// instantiated here or the model loader fails to link.
+template bool llama_model_loader::get_arr<int>(const std::string & key, std::vector<int> & result, bool required);

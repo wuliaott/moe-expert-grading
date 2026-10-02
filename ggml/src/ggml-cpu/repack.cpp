@@ -4923,6 +4923,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+    // 3D tensors are sliced by nb02 in forward_mul_mat_id and the repacked
+    // layout is not verified against that slicing: a grouped MoE model with
+    // ne[2] = 51 scored 3.7313 with repack and 1.5085 with it disabled, while
+    // upstream ne[2] = 256 stays correct. Keep 3D tensors on the plain path.
+    if (cur->ne[3] == 1 && cur->ne[2] > 1) {
+        return nullptr;
+    }
+
     // instance for Q1_0
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 4, 4, GGML_TYPE_Q8_0> q1_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 8, 4, GGML_TYPE_Q8_0> q1_0_4x8_q8_0;

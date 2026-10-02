@@ -157,6 +157,35 @@ public:
     const int64_t n_embd = 0;
 };
 
+// constant global->group expert id tables for graded-precision MoE.
+// graph tensors live in a no_alloc context, so the table bytes cannot be
+// written while the graph is built; they go in through set_input() after the
+// scheduler has allocated them.
+class llm_graph_input_moe_lut : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_lut() = default;
+    virtual ~llm_graph_input_moe_lut() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    void add(ggml_tensor * t, const std::vector<int32_t> * d) {
+        luts.push_back(t);
+        data.push_back(d);
+    }
+
+    void add_mask(ggml_tensor * t, std::vector<float> d) {
+        mask_t.push_back(t);
+        mask_d.push_back(std::move(d));
+    }
+
+    std::vector<ggml_tensor *>              luts; // I32 [1, n_expert, n_tokens]
+    std::vector<const std::vector<int32_t> *> data;
+    std::vector<ggml_tensor *>              mask_t; // F32, same shape
+    std::vector<std::vector<float>>         mask_d; // owned payload
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -942,6 +971,15 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
+    // graded-precision MoE expert groups: t_moe_lut[il][g] is the I32 table
+    // that maps a global expert id to its index inside group g.
+    std::vector<std::vector<ggml_tensor *>> t_moe_lut;
+
+    // t_moe_mask[il][g] is the matching F32 0/1 table. An id the group does not
+    // own also luts to 0, which is a real row, so without this mask those slots
+    // would contribute group g's expert #0 on top of the correct expert.
+    std::vector<std::vector<ggml_tensor *>> t_moe_mask;
+
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
@@ -985,6 +1023,7 @@ struct llm_graph_qkv {
 };
 
 struct llm_graph_context {
+
     const llm_arch arch;
 
     const llama_hparams & hparams;
@@ -1115,6 +1154,14 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    // graded-precision MoE expert groups
+    ggml_tensor * build_moe_mm_id_grp(
+            ggml_tensor ** w_grp,
+            ggml_tensor ** lut_grp,
+            ggml_tensor * cur,
+            ggml_tensor * ids,
+            int il) const;
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
@@ -1134,7 +1181,11 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** gate_exps_grp = nullptr,
+             ggml_tensor ** up_exps_grp   = nullptr,
+             ggml_tensor ** down_exps_grp = nullptr,
+             ggml_tensor ** lut_grp      = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1160,7 +1211,11 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor ** gate_exps_grp = nullptr,
+             ggml_tensor ** up_exps_grp   = nullptr,
+             ggml_tensor ** down_exps_grp = nullptr,
+             ggml_tensor ** lut_grp      = nullptr) const;
 
     //
     // inputs

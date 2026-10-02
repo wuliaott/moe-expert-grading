@@ -3376,6 +3376,102 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
     return create_tensor(*ml, tn, ne, flags);
 }
 
+// graded-precision MoE expert groups
+
+// Build the per-layer group map from GGUF metadata written by the split script.
+// Key: <arch>.moe_expert_groups.<il> is an int32 array of length n_expert whose
+// values are group ids (0 hot, 1 warm, 2 cold). Absent key leaves the layer
+// ungrouped, so ordinary GGUFs load through the unchanged code path.
+void llama_model_base::load_moe_expert_groups(llama_layer & layer, int il, llama_model_loader & ml) {
+    const int64_t n_total = hparams.n_expert;
+    if (n_total <= 0 || n_total > LLAMA_MAX_EXPERTS) {
+        return;
+    }
+
+    // The split script writes one key per layer: <arch>.moe_expert_groups.<il>.
+    // The enum alone yields <arch>.moe_expert_groups with no layer suffix, which
+    // never exists, so every layer read as ungrouped and the tiered tensors were
+    // never asked for.
+    std::string arch;
+    if (!ml.get_key(LLM_KV_GENERAL_ARCHITECTURE, arch, false) || arch.empty()) {
+        return;
+    }
+    const std::string grp_key = LLM_KV(llm_arch_from_string(arch))(LLM_KV_MOE_EXPERT_GROUPS)
+            + "." + std::to_string(il);
+
+    std::vector<int32_t> grp;
+    if (!ml.get_arr(grp_key, grp, false)) {
+        return;
+    }
+    if ((int64_t) grp.size() != n_total) {
+        LLAMA_LOG_WARN("%s: layer %d group array has %zu entries, expected %d; ignoring\n",
+                __func__, il, grp.size(), (int) n_total);
+        return;
+    }
+
+    struct llama_moe_expert_map & m = layer.moe_grp;
+    m.reset(n_total);
+
+    for (int64_t e = 0; e < n_total; ++e) {
+        const int32_t g = grp[e];
+        if (g < 0 || g >= MOE_N_GRP) {
+            LLAMA_LOG_WARN("%s: layer %d expert %d has group %d out of range; ignoring groups\n",
+                    __func__, il, (int) e, g);
+            m.reset(n_total);
+            return;
+        }
+        m.grp_of[e]   = (int8_t) g;
+        m.local_of[e] = (int16_t) m.n_expert[g]++;
+        m.lut[g][e]   = m.local_of[e];
+    }
+
+    for (int g = 0; g < MOE_N_GRP; ++g) {
+        if (m.n_expert[g] <= 0) {
+            LLAMA_LOG_WARN("%s: layer %d group %d is empty; ignoring groups\n",
+                    __func__, il, g);
+            m.reset(n_total);
+            return;
+        }
+    }
+
+    m.active = true;
+    LLAMA_LOG_INFO("%s: layer %d expert groups: hot %d / warm %d / cold %d (of %d)\n",
+            __func__, il, (int) m.n_expert[MOE_GRP_HOT], (int) m.n_expert[MOE_GRP_WARM],
+            (int) m.n_expert[MOE_GRP_COLD], (int) n_total);
+}
+
+void llama_model_base::create_tensor_exps_groups(llama_layer & layer, int bid,
+        int64_t n_embd_, int64_t n_ff_, int flags) {
+    const struct llama_moe_expert_map & m = layer.moe_grp;
+    if (!m.active) {
+        return;
+    }
+
+    static const enum llm_tensor g_gate[MOE_N_GRP] = {
+        LLM_TENSOR_FFN_GATE_EXPS_HOT, LLM_TENSOR_FFN_GATE_EXPS_WARM, LLM_TENSOR_FFN_GATE_EXPS_COLD,
+    };
+    static const enum llm_tensor g_up[MOE_N_GRP] = {
+        LLM_TENSOR_FFN_UP_EXPS_HOT, LLM_TENSOR_FFN_UP_EXPS_WARM, LLM_TENSOR_FFN_UP_EXPS_COLD,
+    };
+    static const enum llm_tensor g_down[MOE_N_GRP] = {
+        LLM_TENSOR_FFN_DOWN_EXPS_HOT, LLM_TENSOR_FFN_DOWN_EXPS_WARM, LLM_TENSOR_FFN_DOWN_EXPS_COLD,
+    };
+
+    for (int g = 0; g < MOE_N_GRP; ++g) {
+        const int64_t ne = m.n_expert[g];
+
+        layer.ffn_gate_exps_grp[g] = create_tensor(
+                tn(g_gate[g], "weight", bid), { n_embd_, n_ff_, ne }, flags);
+
+        layer.ffn_up_exps_grp[g] = create_tensor(
+                tn(g_up[g], "weight", bid), { n_embd_, n_ff_, ne },
+                layer.ffn_gate_exps_grp[g] ? TENSOR_NOT_REQUIRED : flags);
+
+        layer.ffn_down_exps_grp[g] = create_tensor(
+                tn(g_down[g], "weight", bid), { n_ff_, n_embd_, ne }, flags);
+    }
+}
+
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
     if (flags & TENSOR_SKIP) {
         const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
