@@ -10,6 +10,22 @@ cd llama.cpp && patch -p1 < graded-moe-0c1e570.patch
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release -j
 ```
 
+## Release binaries
+
+**`llama-fork-vulkan-graded-win-x64.zip`** (20 MB) — Windows x64, CPU + Vulkan,
+built from this fork with the repack guard. Verified on an AMD Radeon
+RX 5700 XT (8 GB).
+
+```sh
+unzip llama-fork-vulkan-graded-win-x64.zip
+cd llama-fork-vulkan-graded
+llama-cli.exe --list-devices
+```
+
+**Scope of verification:** Qwen3.6-35B-A3B only (256 experts per layer, top-8,
+40 layers). Other architectures are untested. Speculative decoding (draft
+models, MTP) has not been verified with tiered expert tensors.
+
 ## Tiered expert tensors
 
 Instead of one `ffn_gate_exps.weight` per layer, the model stores one tensor per
@@ -29,19 +45,6 @@ the cold tier can sit three bits below the hot tier at almost no perplexity cost
 
 Non-expert tensors (router, norms, attention, shared experts, output) keep their
 normal types.
-
-## Results
-
-Qwen3.6-35B-A3B, 14 × 512-token chunks, `-t 20`:
-
-| model | size | PPL |
-|---|---:|---:|
-| F16 reference | 67 GB | 1.5053 |
-| **graded v8** — hot Q4_K + Q5_K down, warm Q3_K + Q4_K down, cold Q3_K | **17.26 GiB** | **1.5030** |
-| **graded v10** — hot Q4_K, warm Q3_K, cold Q2_K gate/up | **15.59 GiB** | **1.5096** |
-| APEX I-Compact (upstream) | 16.10 GiB | 1.5125 |
-
-Variance is ±0.029.
 
 ## Also fixes a CPU repack bug
 
