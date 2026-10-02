@@ -34,10 +34,11 @@ models, MTP) has not been verified with tiered expert tensors.
 
 ## Tiered expert tensors
 
-Instead of one `ffn_gate_exps.weight` per layer, the model stores one tensor per
-tier — `ffn_gate_exps_hot`, `_warm`, `_cold` — independently for gate / up /
-down, each in its own quantization type. One extra F32 tensor
-`moe_expert_groups.N` per layer records the tier boundaries.
+Instead of one expert tensor per layer, the model carries three — one per tier,
+named `ffn_gate_exps_hot`, `ffn_gate_exps_warm` and `ffn_gate_exps_cold` for the
+gate projection, and the same way for up and down. Each is quantized to its own
+type. One extra F32 tensor per layer, `moe_expert_groups.N`, records the tier
+boundaries.
 
 Tiers come from ranking each layer's experts by activation energy measured with
 an importance matrix: top 20% hot (51 experts), next 30% warm (77), rest cold
