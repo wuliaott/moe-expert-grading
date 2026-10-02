@@ -1,126 +1,125 @@
-# llama.cpp
+# llama.cpp — Graded-MoE fork
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) at
+`0c1e570` (webgpu: fix SSM_SCAN binding aliasing, #29750) carrying two
+independent changes for **per-tier expert quantization** of Mixture-of-Experts
+models, verified on Qwen3.6-35B-A3B (256 experts / layer, top-8, 40 layers):
 
-<div align="center">
+1. **Per-tier expert tensors** — MoE expert weights can be split into
+   `hot` / `warm` / `cold` tiers, each quantized to a different type, while the
+   router keeps routing over the full 256-expert space.
+2. **CPU repack guard** — a bug fix: the CPU weight-repack path produces
+   corrupted results on 3D expert tensors whose expert count is not a multiple
+   of 8. (See [repack bug](#cpu-repack-bug-on-3d-tensors).)
 
-<b>LLM inference in C/C++</b>
+Both changes are in a single 10-file patch, 38,945 bytes, md5
+`7f2cd69518f4ae8c7e4ab8fa20259a57`, which applies cleanly to the upstream
+commit above with `patch -p1`.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+## Results
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+Qwen3.6-35B-A3B, same 14-chunk corpus, `-t 20`, single machine:
 
-</div>
+| model | size | PPL |
+|---|---:|---:|
+| F16 | 67 GB | 1.5053 |
+| **graded v8** (Q4_K / Q3_K / Q2_K-K-mixed tiers) | **17.26 GiB** | **1.5030** |
+| graded v10 | 15.59 GiB | 1.5096 |
+| APEX I-Compact (upstream) | 16.10 GiB | 1.5125 |
+| upstream Q4_K_S | 20 GB | 1.5167 |
+| upstream Q3_K_S | 15 GB | 1.5404 |
 
-## Quick start
+Run-to-run variance is ±0.029. The graded variants are within ~0.004 of the
+F16 ceiling; v10 is 0.51 GiB smaller than APEX with a better PPL.
 
-A few options to get `llama.cpp` installed on your machine:
+Threading, same model, this fork with the guard enabled:
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+| test | t/s |
+|---|---:|
+| pp512 | 110.88 ± 3.65 |
+| tg64 | 17.42 ± 0.47 |
 
-Once installed:
+## How per-tier tensors work
+
+Per layer, the 256 experts are ranked by activation energy (from an imatrix)
+and split into tiers: 20% hot, 30% warm, 50% cold. The model stores, per
+layer and per projection (gate / up / down), one tensor per tier —
+e.g. `blk.N.ffn_gate_exps_hot`, `blk.N.ffn_gate_exps_warm`,
+`blk.N.ffn_gate_exps_cold` — each in its own quantization type, plus one
+F32 tensor `moe_expert_groups.N` describing the tier→expert-id mapping.
+
+At load time the reader registers the tier tensors and the group metadata;
+at graph build time each `mul_mat_id` is dispatched through
+`build_moe_mm_id_grp`, which uses a small lookup table over tier ids plus a
+mask of tokens whose expert ids fall inside the tier, so all three tiers are
+served by one graph pass over the same 256-wide router output. Non-expert
+tensors (router, norms, attention, shared experts, output) keep their normal
+types.
+
+## CPU repack bug on 3D tensors
+
+`ggml_repack_get_optimal_repack_type()` in `ggml/src/ggml-cpu/repack.cpp`
+has a trait for `Q4_K` / `Q5_K` (but not `Q3_K`) and does not check the
+tensor's dimensionality. A 3D expert tensor with `ne[3] == 1`, `ne[2] > 1`
+and `ne[2] % 8 != 0` (our tier sizes are 51 / 77 / 128) is therefore routed
+into the 8×8 interleaved repack layout, which does not match how
+`forward_mul_mat_id` slices expert data:
+
+| same model file | PPL |
+|---|---:|
+| repack enabled (trait matches) | 3.7313 |
+| repack disabled (`GGML_CPU_REPACK=OFF`) | 1.5085 |
+| upstream merged model, `ne[2] = 256` (256 % 8 == 0) | 1.5167 — unaffected |
+
+The fix is a guard in `get_optimal_repack_type()`: 3D tensors return
+`nullptr` and fall back to the plain path. Bench on the 17 GiB model shows
+no measurable cost (pp512 110.15 vs 110.88 t/s, tg64 16.85 vs 17.42 t/s,
+both inside error bars) — MoE activates ~3% of experts per token, which is
+not the access pattern the interleaved layout optimizes for.
+
+This is an upstream-eligible fix; the guard is ~3 lines.
+
+## Building
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+git clone --depth 1 --branch 0c1e570 https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+patch -p1 < path/to/fork.patch     # or: git apply fork.patch
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+GPU backends are orthogonal and unaffected. The guard is compiled in
+regardless of `-DGGML_CPU_REPACK`; with `GGML_CPU_REPACK=OFF` it is a no-op.
 
-## Description
+## Verification checklist (reproducible)
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+| step | command / artifact |
+|---|---|
+| patch applies | `git apply --check fork.patch` against `0c1e570` |
+| tier tensors correct | `split_moe_experts.py` byte-compares all 768 expert slabs + 633 passthrough tensors against the source |
+| repack verdict | `verify_norepack.sh`: two builds (`GGML_CPU_REPACK` ON/OFF), one model, one corpus → 3.73 vs 1.51 |
+| PPL | `llama-perplexity -m graded-v8.gguf -f corpus -t 20` → 1.5030 |
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+## Files changed
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+| file | change |
+|---|---|
+| `ggml/src/ggml-cpu/repack.cpp` | 3D guard in `get_optimal_repack_type()` |
+| `ggml/include/llama/ggml-llama.h` | tier tensor enum + group metadata key |
+| `src/llama-arch.cpp` | tier tensor registration for MoE archs |
+| `src/llama-graph.cpp` | `build_moe_mm_id_grp` (LUT + mask), dispatch |
+| `src/llama-model.cpp` | reader: tier tensors + `moe_expert_groups` |
+| `src/llama-mmap.cpp` (+4 more) | support / instantiation (`get_arr<std::string,int>`) |
 
-## Supported backends
+Full list and per-file diffs in `fork_0c1e570.patch`.
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## Status
 
-## Documentation
+- [x] Local (Windows / MSVC) build with guard: `--version` OK, all binaries
+- [x] Full pipeline on cloud Linux build: v8 1.5030, v10 1.5096
+- [ ] Upstream PR for the repack guard (pending)
+- [ ] Windows binary release
 
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+MIT, same as upstream.
