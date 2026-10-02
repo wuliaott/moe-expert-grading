@@ -4,6 +4,12 @@ llama.cpp fork for **per-tier MoE expert quantization**. Each layer's experts
 are split into hot / warm / cold tiers, and each tier is quantized to its own
 bit width. Based on upstream `0c1e570`.
 
+> **This fork was written by an AI coding agent**, working from a written
+> design and from benchmark measurements taken while developing it. The
+> numbers in this repo are real and reproducible with the scripts in
+> `llama.cpp-fork/`, but no human outside the project has reviewed the code.
+> Read the patch before relying on it.
+
 ```sh
 git clone --depth 1 --branch 0c1e570 https://github.com/ggml-org/llama.cpp
 cd llama.cpp && patch -p1 < graded-moe-0c1e570.patch
